@@ -2,7 +2,7 @@ name: grav_comp_demo
 
 dynamixel:
   # USB port name given by the command: ls /dev/serial/by-id/
-  dynamixel_port: "usb-FTDI_USB__-__Serial_Converter_FT951EJA-if00-port0"
+  dynamixel_port: "usb-FTDI_USB__-__Serial_Converter_FT763IIH-if00-port0"
   # Servo types
   servo_types: [
     "XC330_T288_T", "XM430_W210_T", "XC330_T288_T", "XM430_W210_T", 
@@ -15,14 +15,15 @@ arm_teleop:
   # URDF used for creating leader arm dynamics model to compute gravity compensation
   leader_urdf: "factr_teleop_franka.urdf"
   num_arm_joints: 7
-  arm_joint_limits_max: [2.8973, 1.7628, 2.8973, -0.8698, 2.8973, 3.7525, 2.8973]
+  arm_joint_limits_max: [2.8973, 1.7628, 2.8973, -0.0698, 2.8973, 3.7525, 2.8973]
   arm_joint_limits_min: [-2.8973, -1.7628, -2.8973, -3.0718, -2.8973, -0.0175, -2.8973]
   arm_joint_limits_safety_margin: 0.1
   initialization:
     # The expected leader arm joint position before launching the script
-    calibration_joint_pos: [0.0, -0.7854, 0.0, -2.356, 0.0, 1.57, 0.0]
+    calibration_joint_pos: [0.0, 0, 0.0, 0, 0.0, 0, 0.0]
     # The leader arm must be brought to this joint position before the follower starts mirroring the leader
     initial_match_joint_pos: [0.0, -0.7854, 0.0, -2.356, 0.0, 1.57, 0.0]
+    
   
 gripper_teleop:
   # The maximum range (in rad) of the leader gripper trigger
@@ -44,7 +45,7 @@ controller:
     kd: 0.01
   static_friction_comp:
     enable_speed: 0.9
-    gain: 0.6
+    gain: 0.25
   joint_limit_barrier:
     kp: 1.03561658022
     kd: 0.04315069084
@@ -55,5 +56,18 @@ controller:
 
   gripper_feedback:
     enable: False
+    gain: 0.28328611898
+    ema_beta: 0.95
 
+calibration:
+  stationary_velocity_threshold: 0.20     # increase if noise prevents counting
+  trigger_motion_threshold: 0.20          # how much the trigger must move (rad)
+  stationary_duration: 1                # seconds to hold still
+  velocity_filter_alpha: 0.3              # EMA smoothing factor for |vel|
+  position_noise_floor: 0.01              # max |Δpos| allowed while “stationary” (rad)
+
+zmq:
+  action_pub: "tcp://127.0.0.1:6001"     # node publishes [7 joints, 1 gripper] here
+  action_sub: null                        # optional: if set, node can forward incoming actions
+  forward_source: "device"                # 'device' to publish local joints; 'zmq' to forward sub
 

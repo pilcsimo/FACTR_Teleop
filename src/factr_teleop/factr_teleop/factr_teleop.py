@@ -25,6 +25,7 @@ import pinocchio as pin
 from abc import ABC, abstractmethod
 
 from rclpy.node import Node
+from rcl_interfaces.msg import SetParametersResult
 from python_utils.utils import get_workspace_root
 from factr_teleop.dynamixel.driver import DynamixelDriver
 
@@ -117,17 +118,156 @@ class FACTRTeleop(Node, ABC):
         self.torque_feedback_damping = self.config["controller"]["torque_feedback"]["damping"]
         # gripper feedback
         self.enable_gripper_feedback = self.config["controller"]["gripper_feedback"]["enable"]
+
+        # Initialize joint offsets (raw->zeroed)
+        self.joint_offsets = np.zeros(getattr(self, "num_motors", self.num_arm_joints + 1), dtype=float)
         
         # needs to be implemented to establish communication between the leader and the follower
         self.set_up_communication()
 
-        # calibrate the leader arm joints before starting
-        self._get_dynamixel_offsets()
-        # ensure the leader and the follower arms have the same joint positions before starting
-        self._match_start_pos()
-        # start the control loop
+        # --- Trigger-gesture based calibration state machine (no stdin) ---
+        self._setup_trigger_calibration()
+
+        # start the control loop (will idle until calibration completes)
         self.timer = self.create_timer(self.dt, self.control_loop_callback)
 
+    def _setup_trigger_calibration(self):
+        calib_cfg = self.config.get("calibration", {})
+
+        # Allow YAML and ROS params to override these at runtime
+        self.declare_parameters(
+            namespace='',
+            parameters=[
+                ('calibration.stationary_velocity_threshold', float(calib_cfg.get('stationary_velocity_threshold', 0.05))),
+                ('calibration.trigger_motion_threshold', float(calib_cfg.get('trigger_motion_threshold', 0.20))),
+                ('calibration.stationary_duration', float(calib_cfg.get('stationary_duration', 0.5))),
+                ('calibration.velocity_filter_alpha', float(calib_cfg.get('velocity_filter_alpha', 0.2))),
+                ('calibration.position_noise_floor', float(calib_cfg.get('position_noise_floor', 0.005))),
+            ]
+        )
+        self.calib_vel_thresh = float(self.get_parameter('calibration.stationary_velocity_threshold').value)
+        self.calib_trigger_motion = float(self.get_parameter('calibration.trigger_motion_threshold').value)
+        self.calib_stationary_duration = float(self.get_parameter('calibration.stationary_duration').value)
+        self.calib_alpha = float(self.get_parameter('calibration.velocity_filter_alpha').value)
+        self.calib_pos_noise_floor = float(self.get_parameter('calibration.position_noise_floor').value)
+        self.calib_stationary_samples = max(1, int(self.calib_stationary_duration / self.dt))
+
+        self.add_on_set_parameters_callback(self._on_calib_params_updated)
+
+        self._calib_state = "WAIT_ZERO_GESTURE"
+        self._stationary_counter = 0
+        self._calib_zero_baseline = None
+        self._last_info_log_time = 0.0
+        self._vel_filt = np.zeros(self.num_arm_joints)   # EMA filtered |vel|
+        self._stationary_pos_ref = None                  # Position ref for deadband
+        self.control_enabled = False
+
+        try:
+            self.driver.set_torque_mode(False)
+        except Exception as e:
+            self.get_logger().warn(f"Failed to disable torque for calibration: {e}")
+
+        self.get_logger().info(
+            "Calibration: Place the leader arm at MECHANICAL ZERO.\n"
+            f"- Keep the first {self.num_arm_joints} joints stationary "
+            f"(|vel|<{self.calib_vel_thresh:.3f} rad/s, pos Δ<{self.calib_pos_noise_floor:.4f} rad) "
+            f"for {self.calib_stationary_duration:.2f}s.\n"
+            f"- Then move the TRIGGER (joint {self.num_arm_joints}) by ≥{self.calib_trigger_motion:.2f} rad to ACCEPT ZERO.\n"
+            "Move to your START pose and repeat the trigger gesture to begin control.\n"
+            "Tip: You can tune parameters via ROS: "
+            "'ros2 param set /factr_teleop calibration.stationary_velocity_threshold 0.2'"
+        )
+
+    def _on_calib_params_updated(self, params):
+        updated = False
+        for p in params:
+            if p.name == 'calibration.stationary_velocity_threshold':
+                self.calib_vel_thresh = float(p.value); updated = True
+            elif p.name == 'calibration.trigger_motion_threshold':
+                self.calib_trigger_motion = float(p.value); updated = True
+            elif p.name == 'calibration.stationary_duration':
+                self.calib_stationary_duration = float(p.value)
+                self.calib_stationary_samples = max(1, int(self.calib_stationary_duration / self.dt))
+                updated = True
+            elif p.name == 'calibration.velocity_filter_alpha':
+                self.calib_alpha = float(p.value); updated = True
+            elif p.name == 'calibration.position_noise_floor':
+                self.calib_pos_noise_floor = float(p.value); updated = True
+        if updated:
+            self.get_logger().info(
+                f"Calibration params: vel_thresh={self.calib_vel_thresh:.3f}, "
+                f"trigger_motion={self.calib_trigger_motion:.3f}, "
+                f"duration={self.calib_stationary_duration:.2f}s, "
+                f"alpha={self.calib_alpha:.2f}, pos_floor={self.calib_pos_noise_floor:.4f}"
+            )
+        return SetParametersResult(successful=True, reason='calibration params updated')
+
+    def _calibration_step(self):
+        raw_pos, raw_vel = self.driver.get_positions_and_velocities()
+        arm_pos = np.array(raw_pos[0:self.num_arm_joints], dtype=float)
+        arm_abs_vel = np.abs(np.array(raw_vel[0:self.num_arm_joints], dtype=float))
+        trigger_pos = float(raw_pos[-1])
+
+        
+        # Initialize baselines when entering states
+        if self._calib_state == "WAIT_ZERO_GESTURE" and self._calib_zero_baseline is None:
+            self._calib_zero_baseline = np.copy(raw_pos)
+            self._stationary_counter = 0
+
+        # EMA-filtered velocity and position deadband
+        self._vel_filt = self.calib_alpha * arm_abs_vel + (1.0 - self.calib_alpha) * self._vel_filt
+        vel_max = float(np.max(self._vel_filt))
+        if self._stationary_pos_ref is None:
+            self._stationary_pos_ref = arm_pos.copy()
+        pos_delta = float(np.max(np.abs(arm_pos - self._stationary_pos_ref)))
+
+        if vel_max < self.calib_vel_thresh and pos_delta < self.calib_pos_noise_floor:
+            self._stationary_counter += 1
+        else:
+            self._stationary_counter = 0
+            self._stationary_pos_ref = arm_pos.copy()
+
+        now = time.time()
+        def throttled_info(msg, period=1.0):
+            if now - self._last_info_log_time > period:
+                self._last_info_log_time = now
+                self.get_logger().info(msg)
+
+        if self._calib_state == "WAIT_ZERO_GESTURE":
+            trigger_delta = abs(trigger_pos - self._calib_zero_baseline[-1])
+            throttled_info(
+                f"Waiting for ZERO commit: stationary {self._stationary_counter}/{self.calib_stationary_samples}, "
+                f"trigger Δ={trigger_delta:.3f} rad"
+            )
+            if self._stationary_counter >= self.calib_stationary_samples and trigger_delta >= self.calib_trigger_motion:
+                # Accept zero: set offsets so current pose reads as zeros
+                self.joint_offsets = np.array(raw_pos, dtype=float)
+                self._calib_state = "WAIT_START_GESTURE"
+                self._stationary_counter = 0
+                self._calib_zero_baseline = np.copy(raw_pos)  # reuse as baseline for next gesture
+                self.get_logger().info("ZERO accepted. Joint positions will read 0 at this pose.")
+                self.get_logger().info(
+                    "Calibration: Move the leader arm to your desired START pose.\n"
+                    f"- Keep arm joints stationary for {self.calib_stationary_duration:.2f}s,\n"
+                    f"- Then squeeze/release the TRIGGER by ≥{self.calib_trigger_motion:.2f} rad to START control."
+                )
+
+        elif self._calib_state == "WAIT_START_GESTURE":
+            trigger_delta = abs(trigger_pos - self._calib_zero_baseline[-1])
+            throttled_info(
+                f"Waiting for START commit: stationary {self._stationary_counter}/{self.calib_stationary_samples}, "
+                f"trigger Δ={trigger_delta:.3f} rad"
+            )
+            if self._stationary_counter >= self.calib_stationary_samples and trigger_delta >= self.calib_trigger_motion:
+                # Enable torque and control
+                try:
+                    self.driver.set_operating_mode(0)  # current (torque) mode
+                    self.driver.set_torque_mode(True)
+                except Exception as e:
+                    self.get_logger().warn(f"Failed to re-enable torque: {e}")
+                self.control_enabled = True
+                self._calib_state = "DONE"
+                self.get_logger().info("START pose accepted. Beginning gravity compensation and control.")
 
     def _prepare_dynamixel(self):
         """
@@ -237,12 +377,12 @@ class FACTRTeleop(Node, ABC):
         follower arm before the follower arm starts mirroring the leader arm. 
         """
         curr_pos, _, _, _ = self.get_leader_joint_states()
-        while (np.linalg.norm(curr_pos - self.initial_match_joint_pos[0:self.num_arm_joints]) > 0.6):
+        while (np.linalg.norm(curr_pos - self.initial_match_joint_pos[0:self.num_arm_joints]) > 0.5):
             current_joint_error = np.linalg.norm(
                 curr_pos - self.initial_match_joint_pos[0:self.num_arm_joints]
             )
             self.get_logger().info(
-                f"FACTR TELEOP {self.name}: Please match starting joint pos. Current error: {current_joint_error}"
+                f"FACTR TELEOP {self.name}: Please match starting joint pos. Current error: {curr_pos}"
             )
             curr_pos, _, _, _ = self.get_leader_joint_states()
             time.sleep(0.5)
@@ -412,6 +552,15 @@ class FACTRTeleop(Node, ABC):
         support a 500 Hz control frequency, ensure that the Baud Rate is set to 4 Mbps 
         and the Return Delay Time is set to 0 using the Dynamixel Wizard software.
         """
+        # Gate control until trigger-gesture calibration completes
+        if not getattr(self, "control_enabled", False):
+            # Run calibration routine (no torque applied while calibrating)
+            try:
+                self._calibration_step()
+            except Exception as e:
+                self.get_logger().warn(f"Calibration step error: {e}")
+            return
+
         leader_arm_pos, leader_arm_vel, leader_gripper_pos, leader_gripper_vel = self.get_leader_joint_states()
 
         torque_arm = np.zeros(self.num_arm_joints)
